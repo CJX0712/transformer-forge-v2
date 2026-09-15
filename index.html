@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Transformer Forge · 手写微型 GPT 实验室</title>
+<style>
+  :root{ --bg:#f6f8fb; --card:#fff; --ink:#1f2937; --mut:#6b7280; --bd:#e5e7eb; --acc:#2563eb; --ok:#16a34a; --warn:#d97706; }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,"PingFang SC","Microsoft YaHei",sans-serif;
+       background:var(--bg);color:var(--ink);line-height:1.5;padding:18px}
+  h1{font-size:20px;margin:0 0 2px}
+  .sub{color:var(--mut);font-size:13px;margin-bottom:14px}
+  .wrap{display:grid;grid-template-columns:320px 1fr;gap:14px;align-items:start}
+  .card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px;margin-bottom:14px}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  label{font-size:12px;color:var(--mut);display:block;margin-bottom:2px}
+  input{width:100%;padding:6px 8px;border:1px solid var(--bd);border-radius:6px;font-size:13px}
+  button{margin-top:10px;width:100%;padding:9px;border:0;border-radius:7px;background:var(--acc);color:#fff;
+         font-size:14px;font-weight:600;cursor:pointer}
+  button:disabled{opacity:.5;cursor:default}
+  canvas{background:#fff;border:1px solid var(--bd);border-radius:8px;display:block;width:100%}
+  .row{display:flex;gap:14px;flex-wrap:wrap}
+  .stat{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:8px 12px;font-size:13px}
+  .stat b{font-size:18px;display:block;color:var(--acc)}
+  code{background:#eef2ff;padding:1px 5px;border-radius:4px;font-size:12px}
+  .tok{display:inline-block;min-width:22px;text-align:center;padding:3px 5px;margin:2px;border-radius:5px;
+       background:#eef2ff;font-size:13px}
+  .tok.hi{background:#dcfce7;color:#166534}
+  .tok.sep{background:#fef3c7}
+  .muted{color:var(--mut);font-size:12px}
+</style>
+</head>
+<body>
+<h1>Transformer Forge</h1>
+<div class="sub">单文件零依赖 · 从零手写 decoder-only 因果 Transformer（多头自注意力 + 正弦位置编码 + 正弦PE + FFN + LN + 交叉熵 + Adam），合成"复制/回显"任务验证自回归学习</div>
+
+<div class="wrap">
+  <div class="card">
+    <div class="grid">
+      <div><label>内容长度 L</label><input id="L" value="4" min="2" max="8"></div>
+      <div><label>词表内容 C</label><input id="C" value="8" min="3" max="15"></div>
+      <div><label>模型维度 d</label><input id="dModel" value="24" min="8" max="48"></div>
+      <div><label>头数 h</label><input id="nHeads" value="4" min="1" max="8"></div>
+      <div><label>层数</label><input id="layers" value="2" min="1" max="4"></div>
+      <div><label>FFN 维度</label><input id="dFF" value="48" min="16" max="128"></div>
+      <div><label>迭代</label><input id="iters" value="500" min="20" max="600"></div>
+      <div><label>学习率</label><input id="lr" value="0.003" step="0.001" min="0.001" max="0.1"></div>
+      <div><label>批大小</label><input id="batch" value="24" min="4" max="64"></div>
+      <div><label>随机种子</label><input id="seed" value="42" min="1" max="9999"></div>
+    </div>
+    <button id="train">训练模型</button>
+    <div id="status" class="muted" style="margin-top:8px">未训练</div>
+  </div>
+
+  <div>
+    <div class="row" style="margin-bottom:14px">
+      <div class="stat"><b id="stLoss">–</b>最终 loss</div>
+      <div class="stat"><b id="stAcc">–</b>回显准确率</div>
+      <div class="stat"><b id="stFull">–</b>完全匹配 / 测试</div>
+      <div class="stat"><b id="stTime">–</b>训练用时</div>
+    </div>
+
+    <div class="card">
+      <label>训练 loss 曲线</label>
+      <canvas id="lossCanvas" width="640" height="180"></canvas>
+    </div>
+
+    <div class="row">
+      <div class="card" style="flex:1;min-width:280px">
+        <label>注意力热力图（末层 · head 0，行=query，列=key，因果上三角为 0）</label>
+        <canvas id="attnCanvas" width="320" height="320"></canvas>
+      </div>
+      <div class="card" style="flex:1;min-width:280px">
+        <label>自回归生成演示：喂前缀（内容 + 分隔符），模型回显原序列</label>
+        <div id="genIn" class="muted">训练后显示</div>
+        <div id="genOut" style="margin-top:8px"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script id="engine">
+(function(){
+  var TRNS = {};
+
+  TRNS.mulberry32 = function(a){
+    return function(){
+      a|=0; a=a+0x6D2B79F5|0;
+      var t=Math.imul(a^a>>>15,1|a);
+      t=t+Math.imul(t^t>>>7,61|t)^t;
+      return ((t^t>>>14)>>>0)/4294967296;
+    };
+  };
+
+  function randn(rng){
+    var u=0,v=0;
+    while(u===0)u=rng();
+    while(v===0)v=rng();
+    return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);
+  }
+  TRNS.randn = randn;
+
+  function softmax(a){
+    var m=-Infinity;
+    for(var i=0;i<a.length;i++) if(a[i]>m) m=a[i];
+    var s=0, e=new Array(a.length);
+    for(var i=0;i<a.length;i++){ e[i]=Math.exp(a[i]-m); s+=e[i]; }
+    for(var i=0;i<a.length;i++) e[i]/=s;
+    return e;
+  }
+  TRNS.softmax = softmax;
+
+  TRNS.sinusoidalPE = function(maxLen, d){
+    var pe=[];
+    for(var pos=0; pos<maxLen; pos++){
+      var row=[];
+      for(var i=0;i<d;i++){
+        var denom=Math.pow(10000, 2*i/d);
+        row.push((i%2===0)? Math.sin(pos/denom) : Math.cos(pos/denom));
+      }
+      pe.push(row);
+    }
+    return pe;
+  };
+
+  // ---- linear layer ----
+  function Linear(inDim, outDim, rng){
+    var scale=Math.sqrt(2/(inDim+outDim));
+    var W=[], b=new Array(outDim).fill(0);
+    for(var o=0;o<outDim;o++){
+      var r=[];
+      for(var j=0;j<inDim;j++) r.push(randn(rng)*scale);
+      W.push(r);
+    }
+    return {W:W, b:b, inDim:inDim, outDim:outDim};
+  }
+  function linForward(L, x){
+    var n=x.length, out=[];
+    for(var i=0;i<n;i++){
+      var yi=new Array(L.outDim), xi=x[i];
+      for(var o=0;o<L.outDim;o++){
+        var s=L.b[o], Wi=L.W[o];
+        for(var j=0;j<L.inDim;j++) s+=Wi[j]*xi[j];
+        yi[o]=s;
+      }
+      out.push(yi);
+    }
+    return out;
+  }
+  function linBackward(L, x, dy){
+    var n=dy.length, dW=L.W.map(function(r){return r.map(function(){return 0;});});
+    var db=new Array(L.outDim).fill(0);
+    var dx=x.map(function(r){return new Array(L.inDim).fill(0);});
+    for(var i=0;i<n;i++){
+      var xi=x[i], dyi=dy[i];
+      for(var o=0;o<L.outDim;o++){
+        var g=dyi[o]; db[o]+=g;
+        var dWi=dW[o], Wi=L.W[o];
+        for(var j=0;j<L.inDim;j++){ dWi[j]+=g*xi[j]; dx[i][j]+=g*Wi[j]; }
+      }
+    }
+    return {dW:dW, db:db, dx:dx};
+  }
+
+  // ---- layer norm ----
+  function LayerNorm(d){ return {gamma:new Array(d).fill(1), beta:new Array(d).fill(0), d:d}; }
+  function lnForward(LN, x){
+    var n=x.length, d=LN.d, y=[], cache={x:x,mean:[],ivar:[],xhat:[]};
+    for(var i=0;i<n;i++){
+      var xi=x[i], m=0;
+      for(var j=0;j<d;j++) m+=xi[j]; m/=d;
+      var v=0; for(var j=0;j<d;j++){ var t=xi[j]-m; v+=t*t; } v/=d;
+      var iv=1/Math.sqrt(v+1e-5), xh=new Array(d), yi=new Array(d);
+      for(var j=0;j<d;j++){ var t2=(xi[j]-m)*iv; xh[j]=t2; yi[j]=t2*LN.gamma[j]+LN.beta[j]; }
+      y.push(yi); cache.mean.push(m); cache.ivar.push(iv); cache.xhat.push(xh);
+    }
+    return {y:y, cache:cache};
+  }
+  function lnBackward(LN, cache, dy){
+    var n=cache.x.length, d=LN.d;
+    var dgamma=new Array(d).fill(0), dbeta=new Array(d).fill(0);
+    var dx=cache.x.map(function(r){return new Array(d).fill(0);});
+    for(var i=0;i<n;i++){
+      var xh=cache.xhat[i], iv=cache.ivar[i], dyi=dy[i], xi=cache.x[i];
+      var dxh=new Array(d), sum1=0, sum2=0;
+      for(var j=0;j<d;j++){ var t=dyi[j]*LN.gamma[j]; dxh[j]=t; sum1+=t; sum2+=t*xh[j]; }
+      sum1/=d; sum2/=d;
+      var m=cache.mean[i];
+      for(var j=0;j<d;j++){
+        var t2=(dxh[j]-sum1-xh[j]*sum2)*iv;
+        dx[i][j]=t2;
+      }
+      for(var j=0;j<d;j++){ dgamma[j]+=dyi[j]*xh[j]; dbeta[j]+=dyi[j]; }
+    }
+    return {dgamma:dgamma, dbeta:dbeta, dx:dx};
+  }
+
+  // ---- attention ----
+  function Attn(dModel, nHeads, rng){
+    return {Wq:Linear(dModel,dModel,rng), Wk:Linear(dModel,dModel,rng), Wv:Linear(dModel,dModel,rng),
+            Wo:Linear(dModel,dModel,rng), dModel:dModel, nHeads:nHeads, dk:dModel/nHeads};
+  }
+  function attnForward(attn, x){
+    var T=x.length, d=attn.dModel, dk=attn.dk, h=attn.nHeads;
+    var Q=linForward(attn.Wq,x), K=linForward(attn.Wk,x), V=linForward(attn.Wv,x);
+    var A=[], out=[];
+    for(var hh=0;hh<h;hh++) A.push([]);
+    for(var i=0;i<T;i++) out.push(new Array(d).fill(0));
+    var invSqrt=1/Math.sqrt(dk);
+    for(var hh=0;hh<h;hh++){
+      for(var i=0;i<T;i++){
+        var Qi=Q[i].slice(hh*dk, hh*dk+dk), Ai=new Array(T);
+        for(var j=0;j<T;j++){
+          var Kj=K[j].slice(hh*dk, hh*dk+dk), s=0;
+          for(var k=0;k<dk;k++) s+=Qi[k]*Kj[k];
+          s*=invSqrt;
+          if(j>i) s=-1e9;
+          Ai[j]=s;
+        }
+        Ai=softmax(Ai);
+        A[hh].push(Ai);
+        for(var j=0;j<T;j++){
+          if(Ai[j]===0) continue;
+          var Vj=V[j].slice(hh*dk, hh*dk+dk);
+          for(var k=0;k<dk;k++) out[i][hh*dk+k]+=Ai[j]*Vj[k];
+        }
+      }
+    }
+    var proj=linForward(attn.Wo, out);
+    return {Q:Q,K:K,V:V,A:A,out:out,proj:proj,xIn:x,T:T,d:d,dk:dk,h:h};
+  }
+  function zero2(T,d){ var r=[]; for(var i=0;i<T;i++) r.push(new Array(d).fill(0)); return r; }
+  function addInto(a,b){
+    if(Array.isArray(a)){
+      if(typeof a[0]==='number'){ for(var i=0;i<a.length;i++) a[i]+=b[i]; }
+      else { for(var i=0;i<a.length;i++) addInto(a[i],b[i]); }
+    }
+  }
+  function attnBackward(attn, c, dProj, gAttn){
+    var T=c.T, d=c.d, dk=c.dk, h=c.h, invSqrt=1/Math.sqrt(dk);
+    var wOut=linBackward(attn.Wo, c.out, dProj);
+    addInto(gAttn.Wo.W, wOut.dW); addInto(gAttn.Wo.b, wOut.db);
+    var dOut=wOut.dx;
+    var dQ=zero2(T,d), dK=zero2(T,d), dV=zero2(T,d);
+    for(var hh=0;hh<h;hh++){
+      var Ah=c.A[hh];
+      for(var i=0;i<T;i++){
+        var dOh_i=new Array(dk);
+        for(var k=0;k<dk;k++) dOh_i[k]=dOut[i][hh*dk+k];
+        var dA=new Array(T).fill(0);
+        for(var j=0;j<=i;j++){
+          var Vhj=c.V[j].slice(hh*dk, hh*dk+dk);
+          var da=0; for(var k=0;k<dk;k++) da+=dOh_i[k]*Vhj[k];
+          dA[j]=da;
+          for(var k=0;k<dk;k++) dV[j][hh*dk+k]+=Ah[i][j]*dOh_i[k];
+        }
+        for(var j=0;j<=i;j++){
+          var sumk=0; for(var j2=0;j2<=i;j2++) sumk+=Ah[i][j2]*dA[j2];
+          var ds=Ah[i][j]*(dA[j]-sumk);
+          var Qhi=c.Q[i].slice(hh*dk, hh*dk+dk), Khj=c.K[j].slice(hh*dk, hh*dk+dk);
+          for(var k=0;k<dk;k++){
+            dQ[i][hh*dk+k]+=ds*invSqrt*Khj[k];
+            dK[j][hh*dk+k]+=ds*invSqrt*Qhi[k];
+          }
+        }
+      }
+    }
+    var gQ=linBackward(attn.Wq, c.xIn, dQ);
+    var gK=linBackward(attn.Wk, c.xIn, dK);
+    var gV=linBackward(attn.Wv, c.xIn, dV);
+    addInto(gAttn.Wq.W,gQ.dW); addInto(gAttn.Wq.b,gQ.db);
+    addInto(gAttn.Wk.W,gK.dW); addInto(gAttn.Wk.b,gK.db);
+    addInto(gAttn.Wv.W,gV.dW); addInto(gAttn.Wv.b,gV.db);
+    var dx=zero2(T,d);
+    for(var i=0;i<T;i++) for(var k=0;k<d;k++) dx[i][k]=gQ.dx[i][k]+gK.dx[i][k]+gV.dx[i][k];
+    return dx;
+  }
+
+  // ---- ffn ----
+  function FFN(dModel, dFF, rng){ return {L1:Linear(dModel,dFF,rng), L2:Linear(dFF,dModel,rng), dFF:dFF}; }
+  function ffnForward(ffn, x){
+    var h=linForward(ffn.L1,x), a=h.map(function(r){return r.map(function(v){return v>0?v:0;});});
+    var out=linForward(ffn.L2,a);
+    return {out:out, cache:{x:x,h:h,a:a}};
+  }
+  function ffnBackward(ffn, cache, dOut, gFFN){
+    var gb2=linBackward(ffn.L2, cache.a, dOut);
+    addInto(gFFN.L2.W,gb2.dW); addInto(gFFN.L2.b,gb2.db);
+    var da=gb2.dx, dh=da.map(function(r,idx){return r.map(function(v,k){return v*(cache.h[idx][k]>0?1:0);});});
+    var gb1=linBackward(ffn.L1, cache.x, dh);
+    addInto(gFFN.L1.W,gb1.dW); addInto(gFFN.L1.b,gb1.db);
+    return gb1.dx;
+  }
+
+  // ---- transformer block (pre-LN) ----
+  function blockForward(blk, x){
+    var n1=lnForward(blk.ln1, x);
+    var a=attnForward(blk.attn, n1.y);
+    var x1=x.map(function(r,i){return r.map(function(v,k){return v+a.proj[i][k];});});
+    var n2=lnForward(blk.ln2, x1);
+    var f=ffnForward(blk.ffn, n2.y);
+    var x2=x1.map(function(r,i){return r.map(function(v,k){return v+f.out[i][k];});});
+    return {x:x2, n1c:n1.cache, aC:a, x1:x1, n2c:n2.cache, fC:f.cache};
+  }
+  function blockBackward(blk, bc, dX2, gBlk){
+    var dF=dX2;
+    var gF=ffnBackward(blk.ffn, bc.fC, dF, gBlk.ffn);
+    var ln2b=lnBackward(blk.ln2, bc.n2c, gF);
+    var dX1=dX2.map(function(r,i){return r.map(function(v,k){return v+ln2b.dx[i][k];});});
+    addInto(gBlk.ln2.gamma, ln2b.dgamma); addInto(gBlk.ln2.beta, ln2b.dbeta);
+    var dX=dX1;
+    var gA=attnBackward(blk.attn, bc.aC, dX1, gBlk.attn);
+    var ln1b=lnBackward(blk.ln1, bc.n1c, gA);
+    var dXf=dX.map(function(r,i){return r.map(function(v,k){return v+ln1b.dx[i][k];});});
+    addInto(gBlk.ln1.gamma, ln1b.dgamma); addInto(gBlk.ln1.beta, ln1b.dbeta);
+    return dXf;
+  }
+
+  // ---- model ----
+  TRNS.buildModel=function(opts){
+    var o={L:4,C:8,dModel:24,nHeads:4,layers:2,dFF:48,seed:42};
+    for(var k in opts) o[k]=opts[k];
+    var rng=TRNS.mulberry32(o.seed), V=o.C+2, p={tokenEmb:[],blocks:[]};
+    for(var v=0;v<V;v++){ var e=[]; for(var d=0;d<o.dModel;d++) e.push(randn(rng)*0.1); p.tokenEmb.push(e); }
+    for(var b=0;b<o.layers;b++){
+      p.blocks.push({ln1:LayerNorm(o.dModel), ln2:LayerNorm(o.dModel),
+                     attn:Attn(o.dModel,o.nHeads,rng), ffn:FFN(o.dModel,o.dFF,rng)});
+    }
+    p.Wout=Linear(o.dModel, V, rng);
+    return {p:p, pe:TRNS.sinusoidalPE(96,o.dModel), V:V, opts:o};
+  };
+
+  TRNS.forward=function(model, inputs){
+    var T=inputs.length;
+    var x=inputs.map(function(tok,pos){
+      var e=model.p.tokenEmb[tok], pe=model.pe[pos], r=new Array(model.opts.dModel);
+      for(var i=0;i<model.opts.dModel;i++) r[i]=e[i]+pe[i];
+      return r;
+    });
+    var bc=[];
+    for(var b=0;b<model.p.blocks.length;b++){ var c=blockForward(model.p.blocks[b], x); x=c.x; bc.push(c); }
+    var logits=linForward(model.p.Wout, x);
+    return {logits:logits, bc:bc, T:T, x:x, inputs:inputs};
+  };
+
+  function zerosLike(x){
+    if(Array.isArray(x)){
+      if(x.length===0) return [];
+      if(typeof x[0]==='number') return x.map(function(){return 0;});
+      if(Array.isArray(x[0])) return x.map(zerosLike);
+      return x.map(zerosLike);
+    } else if(x && typeof x==='object'){
+      var out={}; for(var k in x) out[k]=zerosLike(x[k]); return out;
+    }
+    return 0;
+  }
+  function walkScalars(node, cb){
+    if(Array.isArray(node)){
+      if(node.length && typeof node[0]==='number'){ for(var i=0;i<node.length;i++) cb(node,i); }
+      else { for(var i=0;i<node.length;i++) walkScalars(node[i],cb); }
+    } else if(node && typeof node==='object'){
+      for(var k in node) walkScalars(node[k],cb);
+    }
+  }
+  function eachScalar3(w,g,o,cb){
+    if(Array.isArray(w)){
+      if(w.length && typeof w[0]==='number'){ for(var i=0;i<w.length;i++) cb(w,g,o,i); }
+      else { for(var i=0;i<w.length;i++) eachScalar3(w[i],g[i],o[i],cb); }
+    } else if(w && typeof w==='object'){
+      for(var k in w) eachScalar3(w[k],g[k],o[k],cb);
+    }
+  }
+
+  TRNS.lossAndGrads=function(model, batch){
+    var gp=zerosLike(model.p), grads={p:gp}, totalLoss=0;
+    for(var bi=0; bi<batch.length; bi++){
+      var ex=batch[bi], c=TRNS.forward(model, ex.inputs), T=c.T;
+      var exLoss=0, dLogits=[];
+      for(var t=0;t<T;t++) dLogits.push(new Array(model.V).fill(0));
+      for(var t=0;t<T;t++){
+        var sm=softmax(c.logits[t]), tgt=ex.targets[t];
+        exLoss += -Math.log(Math.max(sm[tgt],1e-12));
+        for(var v=0;v<model.V;v++) dLogits[t][v]=(1/T)*(sm[v]-(v===tgt?1:0));
+      }
+      totalLoss += exLoss/T;
+      var woutB=linBackward(model.p.Wout, c.x, dLogits);
+      addInto(grads.p.Wout.W, woutB.dW); addInto(grads.p.Wout.b, woutB.db);
+      var dX=woutB.dx;
+      for(var b=model.p.blocks.length-1; b>=0; b--){
+        dX=blockBackward(model.p.blocks[b], c.bc[b], dX, grads.p.blocks[b]);
+      }
+      for(var t=0;t<T;t++){
+        var emb=grads.p.tokenEmb[ex.inputs[t]];
+        for(var k=0;k<model.opts.dModel;k++) emb[k]+=dX[t][k];
+      }
+    }
+    var loss=totalLoss/batch.length;
+    walkScalars(grads.p, function(arr,idx){ arr[idx]/=batch.length; });
+    return {loss:loss, grads:grads};
+  };
+
+  TRNS.adamStep=function(model, grads, opt, lr, t){
+    function step(w,g,o){
+      var m=o[0], v=o[1];
+      for(var i=0;i<w.length;i++){
+        m[i]=0.9*m[i]+0.1*g[i];
+        v[i]=0.999*v[i]+0.001*g[i]*g[i];
+        var mh=m[i]/(1-Math.pow(0.9,t));
+        var vh=v[i]/(1-Math.pow(0.999,t));
+        w[i]-=lr*mh/(Math.sqrt(vh)+1e-8);
+      }
+    };
+    eachScalar3(model.p, grads, opt, function(w,g,o,idx){
+      step(w,g,o);
+    });
+  };
+
+  // global-norm gradient clipping (stabilises transformer training)
+  function clipGrads(p, maxN){
+    var norm=0;
+    walkScalars(p, function(a,i){ norm+=a[i]*a[i]; });
+    norm=Math.sqrt(norm);
+    if(norm>maxN){
+      var s=maxN/norm;
+      walkScalars(p, function(a,i){ a[i]*=s; });
+    }
+  }
+  TRNS.clipGrads = clipGrads;
+
+  function zerosOpt(p){
+    if(Array.isArray(p)){
+      if(p.length && typeof p[0]==='number') return [new Array(p.length).fill(0), new Array(p.length).fill(0)];
+      if(Array.isArray(p[0])) return p.map(zerosOpt);
+      return p.map(zerosOpt);
+    } else if(p && typeof p==='object'){
+      var out={}; for(var k in p) out[k]=zerosOpt(p[k]); return out;
+    }
+    return [0,0];
+  }
+
+  TRNS.makeData=function(rng, n, L, C){
+    var exs=[], DELIM=C, EOS=C+1;
+    for(var i=0;i<n;i++){
+      var content=[];
+      for(var j=0;j<L;j++) content.push((rng()*C)|0);
+      var inputs=content.slice(); inputs.push(DELIM);
+      for(var j2=0;j2<L;j2++) inputs.push(content[j2]);
+      var targets=inputs.slice(1); targets.push(EOS);
+      exs.push({inputs:inputs, targets:targets});
+    }
+    return exs;
+  };
+
+  TRNS.generate=function(model, prefix, steps, rng){
+    var seq=prefix.slice();
+    for(var s=0;s<steps;s++){
+      var c=TRNS.forward(model, seq);
+      var last=c.logits[seq.length-1], best=0, bv=-1e9;
+      for(var v=0;v<model.V;v++){ if(last[v]>bv){ bv=last[v]; best=v; } }
+      if(best===model.V-1) break;
+      seq.push(best);
+    }
+    return seq.slice(prefix.length);
+  };
+
+  TRNS.train=function(opts){
+    var o={L:4,C:8,dModel:24,nHeads:4,layers:2,dFF:48,lr:0.003,iters:500,batch:24,seed:42,evalN:20,clip:1.0};
+    for(var k in opts) o[k]=opts[k];
+    var model=TRNS.buildModel(o);
+    var opt={p:zerosOpt(model.p)};
+    var rng=TRNS.mulberry32(o.seed), hist=[];
+    for(var it=0; it<o.iters; it++){
+      var batch=TRNS.makeData(rng, o.batch, o.L, o.C);
+      var r=TRNS.lossAndGrads(model, batch);
+      if(o.clip>0) clipGrads(r.grads.p, o.clip);
+      TRNS.adamStep(model, r.grads.p, opt.p, o.lr, it+1);
+      hist.push(r.loss);
+    }
+    var evals=[], full=0, tokCorr=0, tokTot=0;
+    var erng=TRNS.mulberry32(12345);
+    for(var e=0;e<o.evalN;e++){
+      var content=[]; for(var j=0;j<o.L;j++) content.push((erng()*o.C)|0);
+      var prefix=content.slice(); prefix.push(o.C);
+      var gen=TRNS.generate(model, prefix, o.L, erng);
+      var okc=0;
+      for(var t=0;t<o.L;t++){ tokTot++; if(gen[t]===content[t]){ okc++; tokCorr++; } }
+      if(okc===o.L) full++;
+      evals.push({content:content, gen:gen.slice(0,o.L)});
+    }
+    return {model:model, hist:hist, evalAcc:tokCorr/tokTot, fullMatch:full, evalN:o.evalN, evals:evals, opts:o};
+  };
+
+  if(typeof globalThis!=='undefined') globalThis.TRNS = TRNS;
+})();
+</script>
+
+<script id="ui">
+if (typeof document === "undefined") return;
+(function(){
+  var $=function(id){ return document.getElementById(id); };
+  var model=null, lastResult=null;
+
+  function cfg(){
+    return {
+      L:+$("L").value, C:+$("C").value, dModel:+$("dModel").value, nHeads:+$("nHeads").value,
+      layers:+$("layers").value, dFF:+$("dFF").value, iters:+$("iters").value, lr:+$("lr").value,
+      batch:+$("batch").value, seed:+$("seed").value
+    };
+  }
+
+  function drawLoss(hist){
+    var cv=$("lossCanvas"), ctx=cv.getContext("2d");
+    ctx.clearRect(0,0,cv.width,cv.height);
+    var W=cv.width,H=cv.height,pad=24;
+    var mx=Math.max.apply(null,hist), mn=Math.min.apply(null,hist);
+    ctx.strokeStyle="#cbd5e1"; ctx.beginPath(); ctx.moveTo(pad,pad); ctx.lineTo(pad,H-pad); ctx.lineTo(W-pad,H-pad); ctx.stroke();
+    ctx.fillStyle="#6b7280"; ctx.font="11px sans-serif";
+    ctx.fillText(mx.toFixed(2),2,pad+4); ctx.fillText(mn.toFixed(2),2,H-pad);
+    ctx.strokeStyle="#2563eb"; ctx.lineWidth=2; ctx.beginPath();
+    for(var i=0;i<hist.length;i++){
+      var x=pad+(W-2*pad)*i/(hist.length-1);
+      var y=H-pad-(H-2*pad)*(hist[i]-mn)/(mx-mn+1e-9);
+      if(i===0)ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }
+    ctx.stroke(); ctx.lineWidth=1;
+  }
+
+  function drawAttn(A, tokens){
+    var cv=$("attnCanvas"), ctx=cv.getContext("2d");
+    ctx.clearRect(0,0,cv.width,cv.height);
+    var n=A.length, cell=Math.min(cv.width,cv.height)/n;
+    for(var i=0;i<n;i++) for(var j=0;j<n;j++){
+      var v=A[i][j];
+      var g=Math.floor(255*(1-v));
+      ctx.fillStyle="rgb("+g+","+g+","+g+")";
+      ctx.fillRect(j*cell,i*cell,cell-1,cell-1);
+    }
+    ctx.fillStyle="#374151"; ctx.font="10px sans-serif";
+    for(var i=0;i<n;i++){
+      ctx.fillText(tokens[i], 2, i*cell+cell/2+3);
+      ctx.fillText(tokens[i], i*cell+cell/2-2, n*cell+10);
+    }
+  }
+
+  function showGen(res){
+    var e=res.evals[0], C=res.opts.C;
+    var inp=e.content.concat([C]);
+    var inHtml=inp.map(function(t){ return '<span class="tok'+(t===C?' sep':'')+'">'+t+'</span>'; }).join('');
+    $("genIn").innerHTML="前缀："+inHtml;
+    var outHtml=e.gen.map(function(t,idx){ return '<span class="tok hi">'+(t===undefined?'·':t)+'</span>'; }).join('');
+    var corr=e.content.map(function(t,idx){ return '<span class="tok'+(e.gen[idx]===t?' hi':'')+'">'+(e.gen[idx]===undefined?'·':e.gen[idx])+'</span>'; }).join('');
+    $("genOut").innerHTML="模型回显："+corr+'  <span class="muted">（高亮=完全匹配）</span>';
+  }
+
+  $("train").addEventListener("click", function(){
+    var btn=$("train"); btn.disabled=true; $("status").textContent="训练中…";
+    setTimeout(function(){
+      var t0=Date.now();
+      var res=TRNS.train(cfg());
+      var dt=((Date.now()-t0)/1000).toFixed(1);
+      lastResult=res; model=res.model;
+      drawLoss(res.hist);
+      // attention of a sample
+      var sample=TRNS.makeData(TRNS.mulberry32(7),1,res.opts.L,res.opts.C)[0];
+      var c=TRNS.forward(model, sample.inputs);
+      drawAttn(c.bc[c.bc.length-1].aC.A[0], sample.inputs);
+      showGen(res);
+      $("stLoss").textContent=res.hist[res.hist.length-1].toFixed(3);
+      $("stAcc").textContent=(res.evalAcc*100).toFixed(1)+"%";
+      $("stFull").textContent=res.fullMatch+"/"+res.evalN;
+      $("stTime").textContent=dt+"s";
+      $("status").textContent="完成 · 末层 head0 注意力已绘制";
+      btn.disabled=false;
+    }, 20);
+  });
+})();
+</script>
+</body>
+</html>
