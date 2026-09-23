@@ -1,5 +1,12 @@
 # Transformer Forge
 
+<p align="center">
+  <a href="https://github.com/CJX0712/transformer-forge-v2/actions/workflows/ci.yml"><img src="https://github.com/CJX0712/transformer-forge-v2/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
+  <a href="https://github.com/CJX0712/transformer-forge-v2/releases"><img src="https://img.shields.io/github/v/release/CJX0712/transformer-forge-v2?sort=semver" alt="release"></a>
+  <a href="https://github.com/CJX0712/transformer-forge-v2/blob/main/LICENSE"><img src="https://img.shields.io/github/license/CJX0712/transformer-forge-v2" alt="license"></a>
+  <img src="https://img.shields.io/badge/author-%E6%99%A8%E6%98%9F-1f6feb" alt="author">
+</p>
+
 **单文件、零依赖**地从零手写一个 decoder-only 因果 Transformer（GPT 的核心架构），在浏览器里跑通训练与自回归生成。没有 PyTorch、没有 TensorFlow、没有外部 CDN——纯 JavaScript。
 
 > 这是「Forge」ML 实验室系列之一：每个算法都从数学公式手写实现，并用可交叉验证的**不变量**证明它真的正确，而不是“看起来能跑”。
